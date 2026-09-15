@@ -1,37 +1,31 @@
-name: Auto Game News TikTok
+name: Parent Game Radar
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [main]
   schedule:
-    - cron: '0 1 * * *'
+    - cron: "0 1 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  generate:
+  make-video:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system packages
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-noto-cjk
-
-      - name: Install Python packages
-        run: |
+          sudo apt-get install -y ffmpeg fonts-noto-cjk curl
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pillow feedparser
 
-      # ---------------------------------------------
-      # VOICEVOX
-      # ---------------------------------------------
       - name: Start VOICEVOX
         run: |
           docker run -d \
@@ -39,17 +33,15 @@ jobs:
             -p 50021:50021 \
             voicevox/voicevox_engine:cpu-latest
 
-          echo "Waiting for VOICEVOX..."
-
-          for i in {1..60}; do
-            if curl -sf http://127.0.0.1:50021/version > /dev/null; then
-              echo "VOICEVOX READY"
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:50021/version >/dev/null 2>&1; then
+              echo "VOICEVOX ready"
               break
             fi
             sleep 2
           done
 
-          curl -sf http://127.0.0.1:50021/version || exit 1
+          curl -fsS http://127.0.0.1:50021/version
 
       - name: Create generator
         run: |
@@ -57,1550 +49,1074 @@ jobs:
           import os
           import re
           import io
-          import hashlib
+          import json
+          import random
           import subprocess
-          from datetime import datetime
-          from urllib.parse import quote, urljoin
+          from pathlib import Path
+          from urllib.parse import quote
 
           import requests
           import feedparser
           from bs4 import BeautifulSoup
-          from PIL import Image, ImageDraw, ImageFont, ImageOps
+          from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
+          OUT = Path("output")
+          IMG = OUT / "images"
+          SCENES = OUT / "scenes"
 
-          # =========================================================
-          # SETTINGS
-          # =========================================================
+          OUT.mkdir(exist_ok=True)
+          IMG.mkdir(exist_ok=True)
+          SCENES.mkdir(exist_ok=True)
 
-          OUT = "output"
-          DEBUG_DIR = os.path.join(OUT, "debug")
-          AUDIO_DIR = os.path.join(OUT, "audio")
-
-          os.makedirs(OUT, exist_ok=True)
-          os.makedirs(DEBUG_DIR, exist_ok=True)
-          os.makedirs(AUDIO_DIR, exist_ok=True)
-
-          MIN_IMAGES = 3
-          MAX_CANDIDATES = 25
-
-          VOICEVOX = "http://127.0.0.1:50021"
-
-          # VOICEVOX speaker
-          # 3 = ずんだもん ノーマル
-          SPEAKER = 3
-
-          LOG = []
-
-
-          def log(x=""):
-              print(x)
-              LOG.append(str(x))
-
-
-          def save_diagnostic():
-              with open(
-                  os.path.join(OUT, "diagnostic.txt"),
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-                  f.write("\n".join(LOG))
-
+          UA = (
+              "Mozilla/5.0 (X11; Linux x86_64) "
+              "AppleWebKit/537.36 Chrome/130 Safari/537.36"
+          )
 
           session = requests.Session()
+          session.headers.update({"User-Agent": UA})
 
-          session.headers.update({
-              "User-Agent":
-                  "Mozilla/5.0 (X11; Linux x86_64) "
-                  "AppleWebKit/537.36 "
-                  "Chrome/139 Safari/537.36"
-          })
+          # ============================================================
+          # 1. Google News
+          # ============================================================
 
-
-          print("=" * 50)
-          print("GAME NEWS RADAR START")
-          print("=" * 50)
-
-
-          # =========================================================
-          # FONT
-          # =========================================================
-
-          FONT_PATHS = [
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+          QUERIES = [
+              "ゲーム 親子 遊べる 新作",
+              "ゲーム 家族 遊べる 新作",
+              "ゲーム 親子 2人",
+              "ゲーム 協力プレイ 新作",
+              "Nintendo Switch 家族 ゲーム",
+              "Switch 2 家族 ゲーム",
+              "子ども ゲーム 新作",
+              "ファミリーゲーム 新作",
           ]
 
-
-          def get_font(size):
-              for path in FONT_PATHS:
-                  if os.path.exists(path):
-                      try:
-                          return ImageFont.truetype(path, size)
-                      except:
-                          pass
-
-              return ImageFont.load_default()
-
-
-          # =========================================================
-          # HTTP
-          # =========================================================
-
-          def get_url(url, timeout=15):
-              try:
-                  r = session.get(url, timeout=timeout)
-
-                  if r.status_code == 200:
-                      return r
-
-              except Exception as e:
-                  log(f"HTTP ERROR: {url} / {e}")
-
-              return None
-
-
-          # =========================================================
-          # GOOGLE NEWS
-          # =========================================================
-
-          NEWS_QUERIES = [
-              "新作ゲーム 発売日",
-              "新作ゲーム 発売決定",
-              "ゲーム 正式リリース",
-              "ゲーム アーリーアクセス",
-              "ゲーム PS5 Switch PC",
-              "ゲーム Switch2",
-              "ゲーム Steam",
-              "新作ゲーム 2026",
-              "新作ゲーム 2027",
-          ]
-
-
-          def google_news(query):
-
-              url = (
-                  "https://news.google.com/rss/search?"
-                  + "q=" + quote(query)
+          def rss_url(q):
+              return (
+                  "https://news.google.com/rss/search?q="
+                  + quote(q)
                   + "&hl=ja&gl=JP&ceid=JP:ja"
               )
 
+          articles = []
+          seen = set()
+
+          for q in QUERIES:
               try:
-                  r = get_url(url)
+                  feed = feedparser.parse(rss_url(q))
 
-                  if not r:
-                      return []
+                  for e in feed.entries:
+                      link = e.get("link", "")
+                      title = e.get("title", "").strip()
 
-                  feed = feedparser.parse(r.content)
+                      if not link or not title or link in seen:
+                          continue
 
-                  result = []
+                      seen.add(link)
 
-                  for item in feed.entries:
+                      summary = BeautifulSoup(
+                          e.get("summary", ""),
+                          "html.parser"
+                      ).get_text(" ", strip=True)
 
-                      result.append({
-                          "title": item.get("title", ""),
-                          "link": item.get("link", ""),
-                          "summary": BeautifulSoup(
-                              item.get("summary", ""),
-                              "html.parser"
-                          ).get_text(" ", strip=True),
-                          "published": item.get("published", "")
+                      articles.append({
+                          "title": title,
+                          "summary": summary,
+                          "link": link,
+                          "published": e.get("published", "")
                       })
 
-                  return result
+              except Exception as ex:
+                  print("RSS ERROR:", ex)
 
-              except Exception as e:
-                  log(f"NEWS ERROR: {e}")
-                  return []
+          print("NEWS:", len(articles))
 
+          # ============================================================
+          # 2. Game title
+          # ============================================================
 
-          # =========================================================
-          # GAME NAME
-          # =========================================================
-
-          def clean_game_name(name):
-
-              name = re.sub(r"\s+", " ", name).strip()
-
-              name = re.sub(
-                  r"が\d{1,2}月\d{1,2}日.*$",
-                  "",
-                  name
-              )
-
-              name = re.sub(
-                  r"は\d{1,2}月\d{1,2}日.*$",
-                  "",
-                  name
-              )
-
-              name = re.sub(
-                  r"。.*$",
-                  "",
-                  name
-              )
-
-              return name.strip(
-                  "『』「」【】 "
-              )[:100]
-
-
-          def extract_game(title):
-
-              m = re.search(
-                  r"『([^』]{2,80})』",
-                  title
-              )
-
-              if m:
-                  return clean_game_name(m.group(1))
-
-              m = re.search(
-                  r"「([^」]{2,80})」",
-                  title
-              )
-
-              if m:
-                  return clean_game_name(m.group(1))
-
-              m = re.search(
-                  r"\b([A-Z][A-Za-z0-9]+"
-                  r"(?:\s+[A-Z][A-Za-z0-9]+){0,5})\b",
-                  title
-              )
-
-              if m:
-                  return clean_game_name(m.group(1))
-
-              s = re.split(
-                  r"[。|｜]",
-                  title
-              )[0]
-
-              s = re.sub(
-                  r"^(ゲーム|新作ゲーム|【[^】]+】)",
-                  "",
-                  s
-              )
-
-              return clean_game_name(s)
-
-
-          # =========================================================
-          # RELEASE DATE
-          # =========================================================
-
-          def normalize_date(y, m, d):
-
-              try:
-                  return (
-                      f"{int(y):04d}/"
-                      f"{int(m):02d}/"
-                      f"{int(d):02d}"
-                  )
-              except:
-                  return None
-
-
-          def extract_release(
-              text,
-              published=""
-          ):
-
-              text = text.replace(
-                  "（", "("
-              ).replace(
-                  "）", ")"
-              )
-
+          def game_title(text):
               patterns = [
-                  r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})",
-                  r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日?"
+                  r"『([^』]{2,80})』",
+                  r"「([^」]{2,80})」",
+                  r'"([^"]{2,80})"',
               ]
 
-              for pattern in patterns:
-
-                  m = re.search(
-                      pattern,
-                      text
-                  )
+              for p in patterns:
+                  m = re.search(p, text)
 
                   if m:
-                      return normalize_date(
-                          *m.groups()
-                      )
+                      value = m.group(1).strip()
 
-              m = re.search(
-                  r"(?<!\d)(\d{1,2})月\s*(\d{1,2})日",
-                  text
-              )
+                      bad = [
+                          "発売日",
+                          "対応機種",
+                          "予約",
+                          "キャンペーン",
+                          "イベント"
+                      ]
 
-              if m:
+                      if not any(x in value for x in bad):
+                          return value
 
-                  year = datetime.now().year
+              text = re.sub(r"【[^】]+】", "", text)
+              text = re.sub(r"\s+", " ", text)
 
-                  month = int(m.group(1))
-                  day = int(m.group(2))
+              return text[:60].strip(" -｜|:：")
 
-                  if month < datetime.now().month - 2:
-                      year += 1
+          # ============================================================
+          # 3. Release date
+          # ============================================================
 
-                  return normalize_date(
-                      year,
-                      month,
-                      day
-                  )
+          def release_date(text):
 
-              m = re.search(
-                  r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)",
-                  text
-              )
+              patterns = [
+                  r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日",
+                  r"(20\d{2})[./-](\d{1,2})[./-](\d{1,2})",
+                  r"(\d{1,2})月\s*(\d{1,2})日",
+              ]
 
-              if m:
+              for p in patterns:
+                  m = re.search(p, text)
 
-                  return normalize_date(
-                      datetime.now().year,
-                      m.group(1),
-                      m.group(2)
-                  )
+                  if not m:
+                      continue
 
-              if re.search(
-                  r"(本日|今日).*(発売|配信|開始|リリース)",
-                  text
-              ):
-                  return datetime.now().strftime(
-                      "%Y/%m/%d"
-                  )
-
-              if published:
-
-                  try:
-
-                      dt = feedparser._parse_date(
-                          published
-                      )
-
-                      if dt:
+                  if len(m.groups()) == 3:
+                      if len(m.group(1)) == 4:
                           return (
-                              f"{dt.tm_year:04d}/"
-                              f"{dt.tm_mon:02d}/"
-                              f"{dt.tm_mday:02d}"
+                              f"{m.group(1)}年"
+                              f"{int(m.group(2))}月"
+                              f"{int(m.group(3))}日"
                           )
 
-                  except:
-                      pass
+                      return f"{int(m.group(1))}月{int(m.group(2))}日"
 
-              return None
+              if re.search(
+                  r"本日|配信中|発売中|発売開始|配信開始",
+                  text
+              ):
+                  return "発売・配信中"
 
+              if "2026年" in text:
+                  return "2026年予定"
 
-          # =========================================================
-          # PLATFORM
-          # =========================================================
+              if "2027年" in text:
+                  return "2027年予定"
 
-          PLATFORM_PATTERNS = [
+              return "発売日未定"
 
-              (r"PS5|PlayStation\s*5", "PS5"),
+          # ============================================================
+          # 4. Platforms
+          # ============================================================
 
-              (r"PS4|PlayStation\s*4", "PS4"),
+          def platforms(text):
 
-              (
-                  r"Switch\s*2|Nintendo\s*Switch\s*2",
-                  "Switch 2"
-              ),
-
-              (
-                  r"Nintendo\s*Switch|"
-                  r"(?<![A-Za-z])Switch(?![A-Za-z])",
-                  "Switch"
-              ),
-
-              (
-                  r"Xbox\s*Series\s*X\|S",
-                  "Xbox Series X|S"
-              ),
-
-              (r"Xbox", "Xbox"),
-
-              (
-                  r"Steam|"
-                  r"(?<![A-Za-z])PC(?![A-Za-z])|"
-                  r"Windows",
-                  "PC"
-              ),
-
-              (r"iOS", "iOS"),
-
-              (r"Android", "Android"),
-          ]
-
-
-          def extract_platforms(text):
+              rules = [
+                  ("Switch 2", r"Switch\s*2|Nintendo Switch 2"),
+                  ("Switch", r"Nintendo Switch(?!\s*2)|Switch"),
+                  ("PS5", r"PS5|PlayStation\s*5"),
+                  ("PS4", r"PS4|PlayStation\s*4"),
+                  ("Xbox", r"Xbox"),
+                  ("PC", r"Steam|PC版|Windows"),
+                  ("スマホ", r"iOS|Android|App Store|Google Play"),
+              ]
 
               result = []
 
-              for pattern, name in PLATFORM_PATTERNS:
-
-                  if re.search(
-                      pattern,
-                      text,
-                      re.I
-                  ):
-
+              for name, pattern in rules:
+                  if re.search(pattern, text, re.I):
                       if name not in result:
                           result.append(name)
 
-              return result
+              return result[:4]
 
+          # ============================================================
+          # 5. Family score
+          # ============================================================
 
-          # =========================================================
-          # ARTICLE
-          # =========================================================
+          POSITIVE = {
+              "親子": 8,
+              "家族": 7,
+              "子ども": 6,
+              "こども": 6,
+              "キッズ": 6,
+              "ファミリー": 6,
+              "協力プレイ": 6,
+              "協力": 4,
+              "co-op": 6,
+              "ローカルマルチ": 7,
+              "マルチプレイ": 4,
+              "2人": 4,
+              "2人プレイ": 6,
+              "4人": 5,
+              "パーティー": 5,
+              "パーティ": 5,
+              "教育": 6,
+              "学習": 6,
+              "知育": 7,
+              "料理": 3,
+              "スポーツ": 3,
+              "レース": 4,
+              "音楽": 3,
+              "リズム": 3,
+              "クラフト": 3,
+              "サンドボックス": 4,
+              "冒険": 2,
+              "探索": 2,
+              "ポケモン": 5,
+              "マリオ": 6,
+              "カービィ": 6,
+              "どうぶつの森": 7,
+              "Minecraft": 6,
+              "マインクラフト": 6,
+          }
 
-          def parse_article(url):
+          NEGATIVE = {
+              "成人向け": -15,
+              "R18": -15,
+              "18禁": -15,
+              "アダルト": -15,
+              "エロ": -15,
+              "性的": -15,
+              "ホラー": -8,
+              "恐怖": -6,
+              "グロ": -15,
+              "ゴア": -15,
+              "残酷": -12,
+              "殺人": -10,
+              "サバイバルホラー": -15,
+          }
 
-              r = get_url(url)
+          def family_score(text):
 
-              if not r:
-                  return {
-                      "text": "",
-                      "images": [],
-                      "title": ""
-                  }
+              low = text.lower()
+              score = 0
+              hits = []
+
+              for key, value in POSITIVE.items():
+                  if key.lower() in low:
+                      score += value
+                      hits.append(key)
+
+              for key, value in NEGATIVE.items():
+                  if key.lower() in low:
+                      score += value
+
+              return score, list(dict.fromkeys(hits))
+
+          # ============================================================
+          # 6. Images
+          # ============================================================
+
+          def get_html(url):
 
               try:
-
-                  soup = BeautifulSoup(
-                      r.text,
-                      "html.parser"
+                  r = session.get(
+                      url,
+                      timeout=12,
+                      allow_redirects=True
                   )
 
-                  for tag in soup(
-                      ["script", "style",
-                       "noscript", "svg"]
-                  ):
-                      tag.decompose()
+                  if r.ok:
+                      return r.text
 
-                  text = soup.get_text(
-                      " ",
-                      strip=True
-                  )
+              except Exception:
+                  pass
 
-                  title = ""
+              return ""
 
-                  if soup.title:
-                      title = soup.title.get_text(
-                          " ",
-                          strip=True
-                      )
+          def page_images(url):
 
-                  images = []
+              html = get_html(url)
 
-                  # OG images
-                  for meta in soup.find_all("meta"):
+              if not html:
+                  return []
 
-                      prop = (
-                          meta.get("property")
-                          or meta.get("name")
-                          or ""
-                      ).lower()
-
-                      if prop in [
-                          "og:image",
-                          "twitter:image",
-                          "twitter:image:src"
-                      ]:
-
-                          content = meta.get(
-                              "content"
-                          )
-
-                          if content:
-                              images.append(
-                                  urljoin(
-                                      url,
-                                      content
-                                  )
-                              )
-
-                  # img
-                  for img in soup.find_all("img"):
-
-                      for attr in [
-                          "src",
-                          "data-src",
-                          "data-original"
-                      ]:
-
-                          src = img.get(attr)
-
-                          if src:
-                              images.append(
-                                  urljoin(
-                                      url,
-                                      src
-                                  )
-                              )
-
-                      srcset = img.get(
-                          "srcset"
-                      )
-
-                      if srcset:
-
-                          for part in srcset.split(","):
-
-                              src = (
-                                  part.strip()
-                                  .split(" ")[0]
-                              )
-
-                              if src:
-                                  images.append(
-                                      urljoin(
-                                          url,
-                                          src
-                                      )
-                                  )
-
-                  unique = []
-                  seen = set()
-
-                  for image in images:
-
-                      if image and image not in seen:
-
-                          seen.add(image)
-                          unique.append(image)
-
-                  return {
-                      "text": text,
-                      "images": unique[:40],
-                      "title": title
-                  }
-
-              except Exception as e:
-
-                  log(
-                      f"ARTICLE ERROR: {e}"
-                  )
-
-                  return {
-                      "text": "",
-                      "images": [],
-                      "title": ""
-                  }
-
-
-          # =========================================================
-          # STEAM
-          # =========================================================
-
-          def steam_images(game):
-
-              log(
-                  f"STEAM SEARCH: {game}"
-              )
-
+              soup = BeautifulSoup(html, "html.parser")
               result = []
 
-              try:
+              for tag in soup.find_all(["meta", "img"]):
 
-                  url = (
-                      "https://store.steampowered.com/"
-                      "api/storesearch/?term="
-                      + quote(game)
-                      + "&l=japanese&cc=jp"
-                  )
+                  u = ""
 
-                  r = get_url(url)
+                  if tag.name == "meta":
+                      if tag.get("property") in [
+                          "og:image",
+                          "twitter:image"
+                      ]:
+                          u = tag.get("content", "")
 
-                  if not r:
-                      return []
-
-                  items = r.json().get(
-                      "items",
-                      []
-                  )
-
-                  for item in items[:3]:
-
-                      appid = item.get(
-                          "id"
+                  else:
+                      u = (
+                          tag.get("src")
+                          or tag.get("data-src")
+                          or ""
                       )
 
-                      if not appid:
-                          continue
+                  if u.startswith("//"):
+                      u = "https:" + u
 
-                      detail_url = (
-                          "https://store.steampowered.com/"
-                          "api/appdetails?"
-                          f"appids={appid}&l=japanese&cc=jp"
-                      )
+                  if u.startswith("http"):
+                      result.append(u)
 
-                      rr = get_url(
-                          detail_url
-                      )
-
-                      if not rr:
-                          continue
-
-                      detail = rr.json().get(
-                          str(appid),
-                          {}
-                      )
-
-                      if not detail.get(
-                          "success"
-                      ):
-                          continue
-
-                      data = detail.get(
-                          "data",
-                          {}
-                      )
-
-                      name = data.get(
-                          "name",
-                          ""
-                      )
-
-                      if (
-                          game.lower()
-                          not in name.lower()
-                          and
-                          name.lower()
-                          not in game.lower()
-                      ):
-                          continue
-
-                      if data.get(
-                          "header_image"
-                      ):
-                          result.append(
-                              data["header_image"]
-                          )
-
-                      for shot in data.get(
-                          "screenshots",
-                          []
-                      ):
-
-                          path = shot.get(
-                              "path_full"
-                          )
-
-                          if path:
-                              result.append(
-                                  path
-                              )
-
-                      if result:
-                          break
-
-              except Exception as e:
-
-                  log(
-                      f"STEAM ERROR: {e}"
-                  )
-
-              return result
-
-
-          # =========================================================
-          # BING IMAGES
-          # =========================================================
+              return result[:30]
 
           def bing_images(game):
 
-              log(
-                  f"BING IMAGE SEARCH: {game}"
+              url = (
+                  "https://www.bing.com/images/search?q="
+                  + quote(game + " game screenshot")
               )
+
+              html = get_html(url)
+
+              if not html:
+                  return []
+
+              soup = BeautifulSoup(html, "html.parser")
+              result = []
+
+              for a in soup.select("a.iusc"):
+
+                  try:
+                      data = json.loads(
+                          a.get("m", "{}")
+                      )
+
+                      u = data.get("turl", "")
+
+                      if u.startswith("http"):
+                          result.append(u)
+
+                  except Exception:
+                      pass
+
+              return result[:30]
+
+          def steam_images(game):
 
               result = []
 
               try:
-
-                  url = (
-                      "https://www.bing.com/images/search?q="
-                      + quote(
-                          game
-                          + " game screenshot"
-                      )
+                  r = session.get(
+                      "https://store.steampowered.com/api/storesearch/",
+                      params={
+                          "term": game,
+                          "l": "japanese",
+                          "cc": "jp"
+                      },
+                      timeout=10
                   )
 
-                  r = get_url(url)
+                  data = r.json()
+                  items = data.get("items", [])
 
-                  if not r:
-                      return []
+                  if not items:
+                      return result
 
-                  matches = re.findall(
-                      r'"murl":"(https?://[^"]+)"',
-                      r.text
+                  appid = items[0].get("id")
+
+                  if not appid:
+                      return result
+
+                  r2 = session.get(
+                      f"https://store.steampowered.com/api/appdetails"
+                      f"?appids={appid}&l=japanese",
+                      timeout=10
                   )
 
-                  for x in matches:
+                  data2 = r2.json()
+                  app = data2.get(
+                      str(appid),
+                      {}
+                  ).get("data", {})
 
-                      x = x.replace(
-                          "\\/",
-                          "/"
-                      )
-
-                      if x not in result:
-                          result.append(x)
-
-                      if len(result) >= 20:
-                          break
-
-              except Exception as e:
-
-                  log(
-                      f"BING ERROR: {e}"
-                  )
-
-              return result
-
-
-          # =========================================================
-          # RELATED NEWS
-          # =========================================================
-
-          def related_article_images(game):
-
-              result = []
-
-              items = google_news(
-                  f'"{game}"'
-              )
-
-              for item in items[:8]:
-
-                  article = parse_article(
-                      item.get(
-                          "link",
-                          ""
-                      )
-                  )
-
-                  for image in article[
-                      "images"
+                  for key in [
+                      "header_image",
+                      "capsule_image",
+                      "library_capsule",
                   ]:
+                      u = app.get(key)
 
-                      if image not in result:
-                          result.append(image)
+                      if u:
+                          result.append(u)
 
-                      if len(result) >= 20:
-                          return result
+                  for s in app.get("screenshots", []):
+                      u = s.get("path_full")
+
+                      if u:
+                          result.append(u)
+
+              except Exception as ex:
+                  print("STEAM ERROR:", ex)
 
               return result
 
-
-          # =========================================================
-          # IMAGE DOWNLOAD / CHECK
-          # =========================================================
-
-          def download_image(
-              url,
-              index
-          ):
+          def download_image(url, path):
 
               try:
-
                   r = session.get(
                       url,
-                      timeout=15
+                      timeout=15,
+                      stream=True
                   )
 
-                  if r.status_code != 200:
-                      return None
+                  if not r.ok:
+                      return False
 
-                  if (
-                      "image"
-                      not in
-                      r.headers.get(
-                          "Content-Type",
-                          ""
-                      ).lower()
-                  ):
-                      return None
+                  data = r.content
 
-                  if len(r.content) < 10000:
-                      return None
+                  if len(data) < 15000:
+                      return False
 
-                  im = Image.open(
-                      io.BytesIO(
-                          r.content
-                      )
-                  )
+                  im = Image.open(io.BytesIO(data))
+                  im.verify()
 
-                  im.load()
+                  path.write_bytes(data)
 
-                  w, h = im.size
+                  im2 = Image.open(path).convert("RGB")
+
+                  w, h = im2.size
 
                   if w < 500 or h < 300:
-                      return None
+                      path.unlink(missing_ok=True)
+                      return False
 
+                  # Reject extremely narrow images.
                   ratio = w / h
 
-                  if (
-                      ratio > 4.5
-                      or
-                      ratio < 0.45
-                  ):
-                      return None
+                  if ratio < 0.45 or ratio > 3.5:
+                      path.unlink(missing_ok=True)
+                      return False
 
-                  # 単色画像除外
-                  thumb = (
-                      im.convert("RGB")
-                      .resize((32, 32))
-                  )
+                  # Reject almost blank images.
+                  thumb = im2.resize((32, 32))
+                  pixels = list(thumb.getdata())
 
-                  pixels = list(
-                      thumb.getdata()
-                  )
+                  brightness = sum(
+                      sum(p) / 3
+                      for p in pixels
+                  ) / len(pixels)
 
-                  avg = [
-                      sum(
-                          p[c]
-                          for p in pixels
-                      ) / len(pixels)
-                      for c in range(3)
-                  ]
+                  if brightness < 8 or brightness > 250:
+                      path.unlink(missing_ok=True)
+                      return False
 
-                  variance = 0
+                  return True
 
-                  for p in pixels:
+              except Exception:
+                  path.unlink(missing_ok=True)
+                  return False
 
-                      variance += sum(
-                          (
-                              p[c] - avg[c]
-                          ) ** 2
-                          for c in range(3)
-                      )
+          # ============================================================
+          # 7. Select candidate
+          # ============================================================
 
-                  variance /= len(pixels)
+          selected = None
 
-                  if variance < 150:
-                      return None
+          candidates = []
 
-                  path = os.path.join(
-                      DEBUG_DIR,
-                      f"candidate_{index:02d}.jpg"
-                  )
+          for article in articles[:100]:
 
-                  im = ImageOps.exif_transpose(
-                      im
-                  )
+              text = (
+                  article["title"]
+                  + " "
+                  + article["summary"]
+              )
 
-                  im.convert(
-                      "RGB"
-                  ).save(
-                      path,
-                      "JPEG",
-                      quality=92
-                  )
+              score, hits = family_score(text)
 
-                  return path
+              if score < 6:
+                  continue
 
-              except:
-                  return None
+              title = game_title(article["title"])
 
+              if len(title) < 2:
+                  continue
 
-          def collect_images(
-              game,
-              article_images
-          ):
+              rel = release_date(text)
+              plats = platforms(text)
 
-              log("")
-              log(
-                  "========== IMAGE TEST =========="
+              candidates.append({
+                  "score": score,
+                  "hits": hits,
+                  "game": title,
+                  "release": rel,
+                  "platforms": plats,
+                  "article": article
+              })
+
+          candidates.sort(
+              key=lambda x: x["score"],
+              reverse=True
+          )
+
+          print("FAMILY CANDIDATES:", len(candidates))
+
+          # ============================================================
+          # 8. Find actual game images
+          # ============================================================
+
+          for candidate in candidates[:20]:
+
+              game = candidate["game"]
+
+              print(
+                  "CHECK:",
+                  game,
+                  "score=",
+                  candidate["score"]
               )
 
               urls = []
 
-              sources = [
-                  ("ARTICLE", article_images),
-                  ("STEAM", steam_images(game)),
-                  (
-                      "RELATED",
-                      related_article_images(game)
-                  ),
-                  ("BING", bing_images(game))
-              ]
+              urls += steam_images(game)
+              urls += bing_images(game)
+              urls += page_images(
+                  candidate["article"]["link"]
+              )
 
-              for source, arr in sources:
+              # Deduplicate
+              unique = []
 
-                  log(
-                      f"IMAGE SOURCE: "
-                      f"{source} / {len(arr)}"
-                  )
+              for u in urls:
+                  if u and u not in unique:
+                      unique.append(u)
 
-                  for url in arr:
+              game_dir = IMG / re.sub(
+                  r"[^a-zA-Z0-9_-]+",
+                  "_",
+                  game
+              )[:40]
 
-                      if (
-                          url
-                          and
-                          url not in urls
-                      ):
-                          urls.append(url)
+              game_dir.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
-              selected = []
-              hashes = set()
+              usable = []
 
-              for i, url in enumerate(
-                  urls[:80],
-                  1
-              ):
+              for idx, url in enumerate(unique[:40]):
 
-                  path = download_image(
-                      url,
-                      i
-                  )
+                  path = game_dir / f"image_{idx}.jpg"
 
-                  if not path:
-                      continue
+                  if download_image(url, path):
 
-                  try:
+                      usable.append(path)
 
-                      with open(
-                          path,
-                          "rb"
-                      ) as f:
-                          h = hashlib.md5(
-                              f.read()
-                          ).hexdigest()
+                      print(
+                          "IMAGE OK:",
+                          path
+                      )
 
-                      if h in hashes:
-
-                          os.remove(path)
-
-                          continue
-
-                      hashes.add(h)
-
-                  except:
-                      pass
-
-                  selected.append(path)
-
-                  log(
-                      f"IMAGE {i}: OK"
-                  )
-
-                  if len(selected) >= MIN_IMAGES:
+                  if len(usable) >= 5:
                       break
 
-              log(
-                  f"SELECTED IMAGES: "
-                  f"{len(selected)}"
+              if len(usable) >= 3:
+
+                  candidate["images"] = usable
+
+                  selected = candidate
+
+                  break
+
+          if not selected:
+
+              print(
+                  "NO VIDEO: "
+                  "親子向け候補またはゲーム画像が不足"
               )
 
-              return selected
+              raise SystemExit(0)
 
+          # ============================================================
+          # 9. Script
+          # ============================================================
 
-          # =========================================================
-          # NEWS SCRIPT
-          # =========================================================
+          game = selected["game"]
+          rel = selected["release"]
+          plats = selected["platforms"]
 
-          def make_script(
-              game,
-              release,
-              platforms,
-              title,
-              summary
-          ):
+          if not plats:
+              plats = ["対応機種は記事で確認"]
 
-              if release:
+          hits = selected["hits"]
 
-                  try:
-                      y, m, d = release.split("/")
-
-                      release_text = (
-                          f"{int(m)}月"
-                          f"{int(d)}日"
-                      )
-
-                  except:
-
-                      release_text = (
-                          "発売日未定"
-                      )
-
-              else:
-
-                  release_text = (
-                      "発売日未定"
-                  )
-
-              game = game[:30]
-
-              platform_text = (
-                  "・".join(
-                      platforms[:3]
-                  )
-                  if platforms
-                  else
-                  "対応機種は今後発表"
-              )
-
-              # タイトルからニュースの特徴を作る
-              raw = (
-                  title
-                  + " "
-                  + summary
-              )
-
-              raw = re.sub(
-                  r"https?://\S+",
-                  "",
-                  raw
-              )
-
-              # 長すぎるニュース本文を適度に圧縮
-              raw = raw.strip()
-
-              if len(raw) > 65:
-                  raw = raw[:65]
-
-              scripts = [
-
-                  f"注目の新作、{game}。",
-
-                  f"{release_text}に発売・配信予定です。",
-
-                  raw if raw else
-                  "新たな情報が公開されました。",
-
-                  f"対応機種は{platform_text}。",
-
-                  "気になる新作は保存しておいて！"
-
+          if any(
+              x in hits
+              for x in [
+                  "協力プレイ",
+                  "協力",
+                  "ローカルマルチ",
+                  "2人プレイ",
+                  "4人",
+                  "co-op"
               ]
+          ):
+              feature = (
+                  "親子で一緒に協力プレイを楽しめるのがポイント。"
+              )
 
-              return scripts
+          elif any(
+              x in hits
+              for x in [
+                  "教育",
+                  "学習",
+                  "知育"
+              ]
+          ):
+              feature = (
+                  "遊びながら考えたり学んだりできるのがポイント。"
+              )
 
+          elif any(
+              x in hits
+              for x in [
+                  "パーティー",
+                  "パーティ"
+              ]
+          ):
+              feature = (
+                  "家族みんなでワイワイ遊びやすい作品。"
+              )
 
-          # =========================================================
-          # VOICEVOX
-          # =========================================================
+          elif any(
+              x in hits
+              for x in [
+                  "クラフト",
+                  "サンドボックス",
+                  "Minecraft",
+                  "マインクラフト"
+              ]
+          ):
+              feature = (
+                  "親子で自由に遊び方を作れるタイプ。"
+              )
 
-          def make_voice(
-              text,
-              index
+          elif any(
+              x in hits
+              for x in [
+                  "マリオ",
+                  "カービィ",
+                  "ポケモン",
+                  "どうぶつの森"
+              ]
+          ):
+              feature = (
+                  "子どもだけでなく大人も一緒に楽しみやすい作品。"
+              )
+
+          else:
+              feature = (
+                  "親子で遊ぶゲーム候補としてチェックしたい作品。"
+              )
+
+          hooks = [
+              f"これ、親子で遊ぶゲーム候補にあり。",
+              f"今度の週末、親子でこれどう？",
+              f"子どもと一緒に遊ぶなら、これ。",
+              f"親子ゲームを探してるなら、これチェック。",
+          ]
+
+          hook = hooks[
+              selected["score"] % len(hooks)
+          ]
+
+          platform_text = "、".join(plats[:3])
+
+          n1 = (
+              f"{hook}"
+              f"{game}の最新情報です。"
+          )
+
+          n2 = (
+              f"{rel}。"
+              f"{feature}"
+          )
+
+          n3 = (
+              f"対応機種は{platform_text}。"
+              f"親子ゲーム候補として保存しておこう。"
+          )
+
+          narrations = [
+              n1[:80],
+              n2[:90],
+              n3[:90]
+          ]
+
+          (OUT / "script.txt").write_text(
+              "\n".join(
+                  f"[{i+1}] {x}"
+                  for i, x in enumerate(narrations)
+              ),
+              encoding="utf-8"
+          )
+
+          (OUT / "source.txt").write_text(
+              f"game={game}\n"
+              f"score={selected['score']}\n"
+              f"family_hits={','.join(hits)}\n"
+              f"release={rel}\n"
+              f"platforms={','.join(plats)}\n"
+              f"source={selected['article']['link']}\n"
+              f"news_title={selected['article']['title']}\n",
+              encoding="utf-8"
+          )
+
+          # ============================================================
+          # 10. Voice
+          # ============================================================
+
+          VOICEVOX = "http://127.0.0.1:50021"
+
+          # ずんだもん
+          SPEAKER = 3
+
+          def make_voice(text, out):
+
+              q = session.post(
+                  VOICEVOX + "/audio_query",
+                  params={
+                      "text": text,
+                      "speaker": SPEAKER
+                  },
+                  timeout=30
+              )
+
+              q.raise_for_status()
+
+              query = q.json()
+
+              query["speedScale"] = 1.08
+              query["intonationScale"] = 1.05
+
+              r = session.post(
+                  VOICEVOX + "/synthesis",
+                  params={
+                      "speaker": SPEAKER
+                  },
+                  json=query,
+                  timeout=60
+              )
+
+              r.raise_for_status()
+
+              out.write_bytes(r.content)
+
+          voice_files = []
+
+          for i, text in enumerate(
+              narrations,
+              1
           ):
 
-              try:
+              path = OUT / f"voice{i}.wav"
 
-                  q = requests.post(
-                      VOICEVOX
-                      + "/audio_query",
-                      params={
-                          "text": text,
-                          "speaker": SPEAKER
-                      },
-                      timeout=30
-                  )
-
-                  if q.status_code != 200:
-
-                      log(
-                          "VOICE QUERY ERROR "
-                          + str(q.status_code)
-                      )
-
-                      return None
-
-                  query = q.json()
-
-                  # 少しテンポを上げる
-                  query[
-                      "speedScale"
-                  ] = 1.10
-
-                  query[
-                      "intonationScale"
-                  ] = 1.05
-
-                  a = requests.post(
-                      VOICEVOX
-                      + "/synthesis",
-                      params={
-                          "speaker": SPEAKER
-                      },
-                      json=query,
-                      timeout=60
-                  )
-
-                  if a.status_code != 200:
-
-                      log(
-                          "VOICE SYNTH ERROR "
-                          + str(a.status_code)
-                      )
-
-                      return None
-
-                  path = os.path.join(
-                      AUDIO_DIR,
-                      f"voice_{index}.wav"
-                  )
-
-                  with open(
-                      path,
-                      "wb"
-                  ) as f:
-                      f.write(a.content)
-
-                  return path
-
-              except Exception as e:
-
-                  log(
-                      f"VOICE ERROR: {e}"
-                  )
-
-                  return None
-
-
-          # =========================================================
-          # BGM
-          # =========================================================
-
-          def make_bgm():
-
-              output = os.path.join(
-                  AUDIO_DIR,
-                  "bgm.wav"
+              make_voice(
+                  text,
+                  path
               )
 
-              # 外部素材ではなくFFmpegで簡易BGMを生成
-              # 低音量なのでナレーションを邪魔しない
-              filter_complex = (
-                  "aevalsrc="
-                  "0.055*sin(2*PI*220*t)"
-                  "+0.035*sin(2*PI*329.63*t)"
-                  "+0.025*sin(2*PI*440*t)"
-                  "+0.018*sin(2*PI*554.37*t)"
-                  ":s=44100:d=15,"
-                  "tremolo=f=2:d=0.25,"
-                  "lowpass=f=1800,"
-                  "volume=0.55"
-              )
+              voice_files.append(path)
 
-              cmd = [
+          # ============================================================
+          # 11. Original BGM
+          # ============================================================
+
+          bgm = OUT / "bgm.wav"
+
+          subprocess.run(
+              [
                   "ffmpeg",
                   "-y",
                   "-f",
                   "lavfi",
                   "-i",
-                  filter_complex,
-                  "-t",
-                  "15",
+                  "sine=frequency=110:duration=15:sample_rate=44100",
+                  "-f",
+                  "lavfi",
+                  "-i",
+                  "sine=frequency=220:duration=15:sample_rate=44100",
+                  "-f",
+                  "lavfi",
+                  "-i",
+                  "sine=frequency=330:duration=15:sample_rate=44100",
+                  "-filter_complex",
+                  (
+                      "[0:a]volume=0.08[a];"
+                      "[1:a]volume=0.045[b];"
+                      "[2:a]volume=0.025[c];"
+                      "[a][b][c]amix=inputs=3:"
+                      "duration=longest,"
+                      "afade=t=in:st=0:d=1,"
+                      "afade=t=out:st=13.5:d=1.5"
+                  ),
                   "-ar",
                   "44100",
                   "-ac",
                   "2",
-                  output
-              ]
+                  str(bgm)
+              ],
+              check=True
+          )
 
-              p = subprocess.run(
-                  cmd,
-                  capture_output=True,
-                  text=True
+          # ============================================================
+          # 12. Visual design
+          # ============================================================
+
+          W = 1080
+          H = 1920
+
+          FONT_BOLD = (
+              "/usr/share/fonts/opentype/noto/"
+              "NotoSansCJK-Bold.ttc"
+          )
+
+          FONT_REG = (
+              "/usr/share/fonts/opentype/noto/"
+              "NotoSansCJK-Regular.ttc"
+          )
+
+          def font(size, bold=True):
+              return ImageFont.truetype(
+                  FONT_BOLD if bold else FONT_REG,
+                  size
               )
 
-              if p.returncode != 0:
+          def fit_cover(im, size):
 
-                  log(
-                      "BGM ERROR"
-                  )
+              tw, th = size
+              iw, ih = im.size
 
-                  log(
-                      p.stderr[-2000:]
-                  )
-
-                  return None
-
-              return output
-
-
-          # =========================================================
-          # VIDEO DESIGN
-          # =========================================================
-
-          def fit_vertical(im):
-
-              return ImageOps.fit(
-                  im,
-                  (1080, 1920),
-                  method=Image.Resampling.LANCZOS,
-                  centering=(0.5, 0.5)
+              scale = max(
+                  tw / iw,
+                  th / ih
               )
 
+              nw = int(iw * scale)
+              nh = int(ih * scale)
 
-          def draw_center(
-              draw,
-              text,
-              y,
-              font,
-              max_width=980
-          ):
+              im = im.resize(
+                  (nw, nh),
+                  Image.Resampling.LANCZOS
+              )
+
+              left = (nw - tw) // 2
+              top = (nh - th) // 2
+
+              return im.crop(
+                  (
+                      left,
+                      top,
+                      left + tw,
+                      top + th
+                  )
+              )
+
+          def wrap_japanese(text, max_chars):
 
               lines = []
               current = ""
 
-              for ch in text:
+              for char in text:
 
-                  test = current + ch
+                  current += char
 
-                  box = draw.textbbox(
-                      (0, 0),
-                      test,
-                      font=font
-                  )
+                  if len(current) >= max_chars:
 
-                  if (
-                      box[2] > max_width
-                      and current
-                  ):
-
-                      lines.append(
-                          current
-                      )
-
-                      current = ch
-
-                  else:
-
-                      current = test
+                      lines.append(current)
+                      current = ""
 
               if current:
-                  lines.append(
-                      current
-                  )
+                  lines.append(current)
 
-              line_height = (
-                  font.size + 12
-              )
+              return lines
 
-              for line in lines[:3]:
+          scene_info = [
+              (
+                  narrations[0],
+                  "親子で遊ぶなら",
+                  "PARENT GAME"
+              ),
+              (
+                  narrations[1],
+                  "ここがポイント",
+                  "CHECK"
+              ),
+              (
+                  narrations[2],
+                  "週末ゲーム候補",
+                  "SAVE"
+              ),
+          ]
 
-                  box = draw.textbbox(
-                      (0, 0),
-                      line,
-                      font=font,
-                      stroke_width=3
-                  )
+          images = selected["images"][:3]
 
-                  width = (
-                      box[2] - box[0]
-                  )
-
-                  x = (
-                      1080 - width
-                  ) // 2
-
-                  # 黒フチ
-                  draw.text(
-                      (x, y),
-                      line,
-                      font=font,
-                      fill="white",
-                      stroke_width=7,
-                      stroke_fill="black"
-                  )
-
-                  y += line_height
-
-              return y
-
-
-          def make_frame(
-              image_path,
-              game,
-              release,
-              platforms,
-              script,
-              index
+          for i, image_path in enumerate(
+              images,
+              1
           ):
 
               im = Image.open(
                   image_path
               ).convert("RGB")
 
-              im = fit_vertical(im)
-
-              # シーンごとに微妙にズーム
-              zoom = (
-                  1.02
-                  + index * 0.012
+              background = fit_cover(
+                  im,
+                  (W, H)
+              ).filter(
+                  ImageFilter.GaussianBlur(20)
               )
 
-              im = im.resize(
+              canvas = background.copy()
+
+              main = fit_cover(
+                  im,
+                  (W, 1300)
+              )
+
+              canvas.paste(
+                  main,
+                  (0, 300)
+              )
+
+              draw = ImageDraw.Draw(
+                  canvas,
+                  "RGBA"
+              )
+
+              # Top gradient area
+              draw.rectangle(
+                  (0, 0, W, 390),
+                  fill=(0, 0, 0, 150)
+              )
+
+              # Bottom caption area
+              draw.rectangle(
+                  (0, 1570, W, H),
+                  fill=(0, 0, 0, 175)
+              )
+
+              # Small badge
+              draw.rounded_rectangle(
+                  (55, 60, 350, 130),
+                  radius=25,
+                  fill=(255, 255, 255, 235)
+              )
+
+              draw.text(
+                  (82, 77),
+                  scene_info[i-1][2],
+                  font=font(27),
+                  fill=(15, 15, 15, 255)
+              )
+
+              # Game title
+              draw.text(
+                  (55, 175),
+                  game[:24],
+                  font=font(57),
+                  fill=(255, 255, 255, 255)
+              )
+
+              # Scene heading
+              draw.text(
+                  (55, 250),
+                  scene_info[i-1][1],
+                  font=font(43),
+                  fill=(255, 235, 80, 255)
+              )
+
+              # Subtitle
+              lines = wrap_japanese(
+                  scene_info[i-1][0],
+                  20
+              )
+
+              y = 1640
+
+              for line in lines[:3]:
+
+                  bbox = draw.textbbox(
+                      (0, 0),
+                      line,
+                      font=font(46)
+                  )
+
+                  tw = bbox[2] - bbox[0]
+
+                  x = (W - tw) // 2
+
+                  draw.text(
+                      (x + 3, y + 3),
+                      line,
+                      font=font(46),
+                      fill=(0, 0, 0, 240)
+                  )
+
+                  draw.text(
+                      (x, y),
+                      line,
+                      font=font(46),
+                      fill=(255, 255, 255, 255)
+                  )
+
+                  y += 66
+
+              # Progress bar
+              x0 = 55
+              x1 = 1025
+              y0 = 1835
+              y1 = 1847
+
+              draw.rounded_rectangle(
+                  (x0, y0, x1, y1),
+                  radius=6,
+                  fill=(255, 255, 255, 90)
+              )
+
+              seg = (x1 - x0) / 3
+
+              draw.rounded_rectangle(
                   (
-                      int(1080 * zoom),
-                      int(1920 * zoom)
+                      x0 + (i - 1) * seg,
+                      y0,
+                      x0 + i * seg,
+                      y1
                   ),
-                  Image.Resampling.LANCZOS
+                  radius=6,
+                  fill=(255, 255, 255, 235)
               )
 
-              left = (
-                  im.width - 1080
-              ) // 2
-
-              top = (
-                  im.height - 1920
-              ) // 2
-
-              im = im.crop(
-                  (
-                      left,
-                      top,
-                      left + 1080,
-                      top + 1920
-                  )
+              canvas.save(
+                  SCENES / f"scene{i}.png"
               )
 
-              draw = ImageDraw.Draw(im)
+          # ============================================================
+          # 13. Visual MP4
+          # ============================================================
 
-              font_title = get_font(72)
-              font_big = get_font(88)
-              font_mid = get_font(60)
-              font_sub = get_font(48)
+          concat = OUT / "scenes.txt"
 
-              # 上部の黒帯
-              draw.rectangle(
-                  (0, 0, 1080, 230),
-                  fill=(0, 0, 0)
-              )
+          concat.write_text(
+              "\n".join(
+                  [
+                      f"file '{(SCENES/'scene1.png').resolve()}'",
+                      "duration 5",
+                      f"file '{(SCENES/'scene2.png').resolve()}'",
+                      "duration 5",
+                      f"file '{(SCENES/'scene3.png').resolve()}'",
+                      "duration 5",
+                      f"file '{(SCENES/'scene3.png').resolve()}'",
+                  ]
+              ),
+              encoding="utf-8"
+          )
 
-              # 下部字幕帯
-              draw.rectangle(
-                  (0, 1500, 1080, 1920),
-                  fill=(0, 0, 0)
-              )
-
-              if index == 0:
-
-                  draw_center(
-                      draw,
-                      "🎮 新作ゲームNEWS",
-                      35,
-                      font_title
-                  )
-
-                  draw_center(
-                      draw,
-                      game,
-                      105,
-                      font_big
-                  )
-
-                  draw_center(
-                      draw,
-                      script[index],
-                      1560,
-                      font_sub
-                  )
-
-              elif index == 1:
-
-                  draw_center(
-                      draw,
-                      "🔥 発売・配信日",
-                      40,
-                      font_title
-                  )
-
-                  draw_center(
-                      draw,
-                      (
-                          f"{release}"
-                          if release
-                          else
-                          "発売日未定"
-                      ),
-                      105,
-                      font_big
-                  )
-
-                  draw_center(
-                      draw,
-                      script[index],
-                      1570,
-                      font_sub
-                  )
-
-              elif index == 2:
-
-                  draw_center(
-                      draw,
-                      "👀 注目ポイント",
-                      45,
-                      font_title
-                  )
-
-                  draw_center(
-                      draw,
-                      script[index],
-                      1540,
-                      font_sub
-                  )
-
-              elif index == 3:
-
-                  draw_center(
-                      draw,
-                      "🎮 対応機種",
-                      45,
-                      font_title
-                  )
-
-                  draw_center(
-                      draw,
-                      (
-                          " / ".join(
-                              platforms[:4]
-                          )
-                          if platforms
-                          else
-                          "情報確認中"
-                      ),
-                      110,
-                      font_mid
-                  )
-
-                  draw_center(
-                      draw,
-                      script[index],
-                      1570,
-                      font_sub
-                  )
-
-              else:
-
-                  draw_center(
-                      draw,
-                      "保存して後でチェック！",
-                      55,
-                      font_title
-                  )
-
-                  draw_center(
-                      draw,
-                      script[index],
-                      1570,
-                      font_sub
-                  )
-
-              return im
-
-
-          # =========================================================
-          # VIDEO + AUDIO
-          # =========================================================
-
-          def make_video(
-              game,
-              release,
-              platforms,
-              images,
-              script
-          ):
-
-              if len(images) < MIN_IMAGES:
-                  return None
-
-              log("")
-              log(
-                  "========== VIDEO =========="
-              )
-
-              # 5シーン
-              frames = []
-
-              for i in range(5):
-
-                  frame = make_frame(
-                      images[
-                          i % len(images)
-                      ],
-                      game,
-                      release,
-                      platforms,
-                      script,
-                      i
-                  )
-
-                  path = os.path.join(
-                      OUT,
-                      f"scene_{i}.png"
-                  )
-
-                  frame.save(
-                      path,
-                      "PNG"
-                  )
-
-                  frames.append(
-                      path
-                  )
-
-              # -----------------------------------------
-              # VOICE
-              # -----------------------------------------
-
-              voices = []
-
-              for i, text in enumerate(
-                  script
-              ):
-
-                  log(
-                      f"VOICE {i+1}: {text}"
-                  )
-
-                  wav = make_voice(
-                      text,
-                      i
-                  )
-
-                  if not wav:
-
-                      log(
-                          "VIDEO SKIP: "
-                          "voice generation failed"
-                      )
-
-                      return None
-
-                  voices.append(
-                      wav
-                  )
-
-              # WAV連結
-              voice_list = os.path.join(
-                  AUDIO_DIR,
-                  "voice_list.txt"
-              )
-
-              with open(
-                  voice_list,
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-
-                  for wav in voices:
-
-                      f.write(
-                          f"file '{os.path.abspath(wav)}'\n"
-                      )
-
-              voice_all = os.path.join(
-                  AUDIO_DIR,
-                  "voice_all.wav"
-              )
-
-              cmd = [
+          subprocess.run(
+              [
                   "ffmpeg",
                   "-y",
                   "-f",
@@ -1608,86 +1124,91 @@ jobs:
                   "-safe",
                   "0",
                   "-i",
-                  voice_list,
-                  "-c:a",
-                  "pcm_s16le",
-                  voice_all
-              ]
-
-              p = subprocess.run(
-                  cmd,
-                  capture_output=True,
-                  text=True
-              )
-
-              if p.returncode != 0:
-
-                  log(
-                      "VOICE CONCAT ERROR"
-                  )
-
-                  log(
-                      p.stderr[-3000:]
-                  )
-
-                  return None
-
-              # -----------------------------------------
-              # BGM
-              # -----------------------------------------
-
-              bgm = make_bgm()
-
-              if not bgm:
-                  return None
-
-              # -----------------------------------------
-              # VIDEO
-              # -----------------------------------------
-
-              concat = os.path.join(
-                  OUT,
-                  "concat.txt"
-              )
-
-              with open(
-                  concat,
-                  "w",
-                  encoding="utf-8"
-              ) as f:
-
-                  for frame in frames:
-
-                      f.write(
-                          f"file '{os.path.abspath(frame)}'\n"
-                      )
-
-                      f.write(
-                          "duration 3\n"
-                      )
-
-                  f.write(
-                      f"file '{os.path.abspath(frames[-1])}'\n"
-                  )
-
-              silent = os.path.join(
-                  OUT,
-                  "silent.mp4"
-              )
-
-              cmd = [
-                  "ffmpeg",
-                  "-y",
-                  "-f",
-                  "concat",
-                  "-safe",
-                  "0",
-                  "-i",
-                  concat,
+                  str(concat),
                   "-vf",
-                  "format=yuv420p",
+                  (
+                      "scale=1080:1920:"
+                      "force_original_aspect_ratio=decrease,"
+                      "pad=1080:1920:"
+                      "(ow-iw)/2:(oh-ih)/2"
+                  ),
+                  "-t",
+                  "15",
                   "-r",
                   "30",
+                  "-c:v",
+                  "libx264",
+                  "-pix_fmt",
+                  "yuv420p",
+                  "-an",
+                  str(OUT / "visual.mp4")
+              ],
+              check=True
+          )
+
+          # ============================================================
+          # 14. Narration concat
+          # ============================================================
+
+          voice_list = OUT / "voice_list.txt"
+
+          voice_list.write_text(
+              "\n".join(
+                  f"file '{p.resolve()}'"
+                  for p in voice_files
+              ),
+              encoding="utf-8"
+          )
+
+          subprocess.run(
+              [
+                  "ffmpeg",
+                  "-y",
+                  "-f",
+                  "concat",
+                  "-safe",
+                  "0",
+                  "-i",
+                  str(voice_list),
+                  "-af",
+                  "apad,atrim=0:15",
+                  "-ar",
+                  "44100",
+                  "-ac",
+                  "2",
+                  str(OUT / "voice_all.wav")
+              ],
+              check=True
+          )
+
+          # ============================================================
+          # 15. Final MP4
+          # ============================================================
+
+          final = OUT / "parent_game_radar.mp4"
+
+          subprocess.run(
+              [
+                  "ffmpeg",
+                  "-y",
+                  "-i",
+                  str(OUT / "visual.mp4"),
+                  "-i",
+                  str(OUT / "voice_all.wav"),
+                  "-i",
+                  str(bgm),
+                  "-filter_complex",
+                  (
+                      "[1:a]volume=1.0[n];"
+                      "[2:a]volume=0.12[b];"
+                      "[n][b]amix=inputs=2:"
+                      "duration=longest:"
+                      "dropout_transition=0[mix]"
+                  ),
+                  "-map",
+                  "0:v:0",
+                  "-map",
+                  "[mix]",
                   "-t",
                   "15",
                   "-c:v",
@@ -1695,581 +1216,39 @@ jobs:
                   "-preset",
                   "veryfast",
                   "-crf",
-                  "19",
-                  "-movflags",
-                  "+faststart",
-                  silent
-              ]
-
-              p = subprocess.run(
-                  cmd,
-                  capture_output=True,
-                  text=True
-              )
-
-              if p.returncode != 0:
-
-                  log(
-                      "VIDEO ERROR"
-                  )
-
-                  log(
-                      p.stderr[-4000:]
-                  )
-
-                  return None
-
-              # -----------------------------------------
-              # MIX
-              # -----------------------------------------
-
-              output = os.path.join(
-                  OUT,
-                  "game_news_tiktok.mp4"
-              )
-
-              cmd = [
-                  "ffmpeg",
-                  "-y",
-
-                  "-i",
-                  silent,
-
-                  "-i",
-                  voice_all,
-
-                  "-i",
-                  bgm,
-
-                  "-filter_complex",
-
-                  # ナレーションを大きく
-                  "[1:a]"
-                  "volume=1.35,"
-                  "apad,"
-                  "atrim=0:15"
-                  "[voice];"
-
-                  # BGMはかなり小さく
-                  "[2:a]"
-                  "volume=0.075,"
-                  "atrim=0:15"
-                  "[bgm];"
-
-                  # ミックス
-                  "[voice][bgm]"
-                  "amix=inputs=2:"
-                  "duration=longest:"
-                  "dropout_transition=0,"
-                  "loudnorm="
-                  "I=-14:"
-                  "TP=-1.5:"
-                  "LRA=11"
-                  "[audio]",
-
-                  "-map",
-                  "0:v",
-
-                  "-map",
-                  "[audio]",
-
-                  "-t",
-                  "15",
-
-                  "-c:v",
-                  "copy",
-
+                  "20",
                   "-c:a",
                   "aac",
-
                   "-b:a",
                   "192k",
-
                   "-movflags",
                   "+faststart",
-
-                  output
-              ]
-
-              p = subprocess.run(
-                  cmd,
-                  capture_output=True,
-                  text=True
-              )
-
-              if p.returncode != 0:
-
-                  log(
-                      "AUDIO MIX ERROR"
-                  )
-
-                  log(
-                      p.stderr[-5000:]
-                  )
-
-                  return None
-
-              if not os.path.exists(
-                  output
-              ):
-                  return None
-
-              size = (
-                  os.path.getsize(output)
-                  / 1024
-                  / 1024
-              )
-
-              log(
-                  f"VIDEO GENERATED: "
-                  f"{output} "
-                  f"({size:.2f} MB)"
-              )
-
-              return output
-
-
-          # =========================================================
-          # COLLECT NEWS
-          # =========================================================
-
-          all_news = []
-          seen_titles = set()
-
-          for query in NEWS_QUERIES:
-
-              log(
-                  f"NEWS: {query}"
-              )
-
-              for item in google_news(
-                  query
-              ):
-
-                  title = item.get(
-                      "title",
-                      ""
-                  ).strip()
-
-                  if (
-                      title
-                      and
-                      title not in seen_titles
-                  ):
-
-                      seen_titles.add(
-                          title
-                      )
-
-                      all_news.append(
-                          item
-                      )
-
-          log("")
-          log(
-              f"ニュース候補: "
-              f"{len(all_news)}"
+                  str(final)
+              ],
+              check=True
           )
 
-
-          # =========================================================
-          # FILTER
-          # =========================================================
-
-          EXCLUDE_WORDS = [
-              "攻略",
-              "レビュー",
-              "中古",
-              "セール",
-              "予約受付終了",
-              "イベントレポート",
-              "大会",
-              "配信終了",
-              "グッズ",
-              "アケコン",
-              "周辺機器",
-              "フィギュア",
-          ]
-
-
-          def looks_like_game_news(
-              title
-          ):
-
-              for word in EXCLUDE_WORDS:
-
-                  if word in title:
-                      return False
-
-              keywords = [
-                  "発売",
-                  "配信",
-                  "リリース",
-                  "アーリーアクセス",
-                  "制作決定",
-                  "発表",
-                  "新作",
-                  "ゲーム",
-              ]
-
-              return any(
-                  x in title
-                  for x in keywords
-              )
-
-
-          # =========================================================
-          # GENERATE
-          # =========================================================
-
-          generated = False
-
-          for idx, item in enumerate(
-              all_news[:MAX_CANDIDATES],
-              1
-          ):
-
-              title = item.get(
-                  "title",
-                  ""
-              )
-
-              link = item.get(
-                  "link",
-                  ""
-              )
-
-              summary = item.get(
-                  "summary",
-                  ""
-              )
-
-              published = item.get(
-                  "published",
-                  ""
-              )
-
-              log("")
-              log(
-                  "-" * 50
-              )
-
-              log(
-                  f"候補: {idx}"
-              )
-
-              log(
-                  title
-              )
-
-              if not looks_like_game_news(
-                  title
-              ):
-
-                  log(
-                      "SKIP: not game news"
-                  )
-
-                  continue
-
-              game = extract_game(
-                  title
-              )
-
-              log(
-                  f"GAME: {game}"
-              )
-
-              article = parse_article(
-                  link
-              )
-
-              combined = (
-                  title
-                  + " "
-                  + summary
-                  + " "
-                  + article["text"][:20000]
-              )
-
-              release = extract_release(
-                  combined,
-                  published
-              )
-
-              platforms = extract_platforms(
-                  combined
-              )
-
-              # -----------------------------------------
-              # RELEASE RETRY
-              # -----------------------------------------
-
-              if not release:
-
-                  log(
-                      "RELEASE RETRY"
-                  )
-
-                  related = google_news(
-                      f'"{game}" 発売 配信'
-                  )
-
-                  for r in related[:8]:
-
-                      text = (
-                          r.get(
-                              "title",
-                              ""
-                          )
-                          + " "
-                          + r.get(
-                              "summary",
-                              ""
-                          )
-                      )
-
-                      date = extract_release(
-                          text
-                      )
-
-                      if date:
-
-                          release = date
-
-                          log(
-                              "RELEASE FOUND: "
-                              + date
-                          )
-
-                          break
-
-              # -----------------------------------------
-              # PLATFORM RETRY
-              # -----------------------------------------
-
-              if not platforms:
-
-                  log(
-                      "PLATFORM RETRY"
-                  )
-
-                  related = google_news(
-                      f'"{game}" '
-                      f'PS5 Switch PC Steam Xbox'
-                  )
-
-                  for r in related[:8]:
-
-                      text = (
-                          r.get(
-                              "title",
-                              ""
-                          )
-                          + " "
-                          + r.get(
-                              "summary",
-                              ""
-                          )
-                      )
-
-                      for platform in extract_platforms(
-                          text
-                      ):
-
-                          if (
-                              platform
-                              not in platforms
-                          ):
-
-                              platforms.append(
-                                  platform
-                              )
-
-              log(
-                  f"RELEASE: {release}"
-              )
-
-              log(
-                  f"PLATFORM: {platforms}"
-              )
-
-              # -----------------------------------------
-              # IMAGE
-              # -----------------------------------------
-
-              images = collect_images(
-                  game,
-                  article["images"]
-              )
-
-              if len(images) < MIN_IMAGES:
-
-                  log(
-                      "SKIP: insufficient images"
-                  )
-
-                  continue
-
-              if not release:
-
-                  release = (
-                      "発売日未定"
-                  )
-
-              # -----------------------------------------
-              # SCRIPT
-              # -----------------------------------------
-
-              script = make_script(
-                  game,
-                  release,
-                  platforms,
-                  title,
-                  summary
-              )
-
-              log("")
-              log(
-                  "========== SCRIPT =========="
-              )
-
-              for i, text in enumerate(
-                  script,
-                  1
-              ):
-
-                  log(
-                      f"{i}: {text}"
-                  )
-
-              # -----------------------------------------
-              # VIDEO
-              # -----------------------------------------
-
-              video = make_video(
-                  game,
-                  release,
-                  platforms,
-                  images,
-                  script
-              )
-
-              if video:
-
-                  source = os.path.join(
-                      OUT,
-                      "source.txt"
-                  )
-
-                  with open(
-                      source,
-                      "w",
-                      encoding="utf-8"
-                  ) as f:
-
-                      f.write(
-                          "GAME NEWS RADAR\n\n"
-                      )
-
-                      f.write(
-                          f"GAME: {game}\n"
-                      )
-
-                      f.write(
-                          f"RELEASE: {release}\n"
-                      )
-
-                      f.write(
-                          f"PLATFORM: {platforms}\n"
-                      )
-
-                      f.write(
-                          f"NEWS: {title}\n"
-                      )
-
-                      f.write(
-                          f"URL: {link}\n\n"
-                      )
-
-                      f.write(
-                          "SCRIPT:\n"
-                      )
-
-                      for text in script:
-
-                          f.write(
-                              text + "\n"
-                          )
-
-                  log("")
-                  log(
-                      "=" * 50
-                  )
-
-                  log(
-                      "SUCCESS"
-                  )
-
-                  log(
-                      f"GAME: {game}"
-                  )
-
-                  log(
-                      f"VIDEO: {video}"
-                  )
-
-                  log(
-                      "=" * 50
-                  )
-
-                  generated = True
-
-                  break
-
-
-          if not generated:
-
-              log("")
-              log(
-                  "=" * 50
-              )
-
-              log(
-                  "動画生成なし"
-              )
-
-              log(
-                  "条件を満たすニュース、"
-                  "画像、音声が見つかりませんでした。"
-              )
-
-              log(
-                  "=" * 50
-              )
-
-
-          save_diagnostic()
+          print("")
+          print("======================================")
+          print("VIDEO CREATED")
+          print(final)
+          print("GAME:", game)
+          print("SCORE:", selected["score"])
+          print("RELEASE:", rel)
+          print("PLATFORMS:", plats)
+          print("======================================")
 
           PY
 
-      - name: Run generator
+      - name: Generate video
         run: |
           python make_game_news.py
 
-      - name: Show output
-        if: always()
-        run: |
-          echo "================ OUTPUT ================"
-          find output -maxdepth 3 -type f \
-            -printf '%p %k KB\n' 2>/dev/null || true
-          echo "========================================"
-
-      - name: Upload diagnostic and video
+      - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: game-news-result-${{ github.run_number }}
+          name: parent-game-radar-${{ github.run_number }}
           path: |
             output/
             make_game_news.py
