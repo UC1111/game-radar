@@ -1,0 +1,198 @@
+name: Game Radar Video
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 7 * * *"
+      timezone: "Asia/Tokyo"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pil fonts-noto-cjk
+
+      - name: Create video
+        run: |
+          python3 <<'PY'
+          import os, re, html, urllib.request, urllib.parse
+          from xml.etree import ElementTree as ET
+          from PIL import Image, ImageDraw, ImageFont
+          from datetime import datetime, timezone, timedelta
+
+          os.makedirs("output", exist_ok=True)
+
+          queries = [
+              "ゲーム 新作 アップデート",
+              "Switch 協力プレイ ゲーム",
+              "PS5 PC クロスプレイ ゲーム",
+              "子供 一緒に遊べる ゲーム"
+          ]
+
+          items = []
+
+          for q in queries:
+              try:
+                  url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(q + " when:1d") + "&hl=ja&gl=JP&ceid=JP:ja"
+                  req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+                  data = urllib.request.urlopen(req, timeout=20).read()
+                  root = ET.fromstring(data)
+
+                  for item in root.findall(".//item"):
+                      title = html.unescape(item.findtext("title","")).strip()
+                      link = item.findtext("link","").strip()
+                      if title:
+                          items.append((title, link))
+              except Exception as e:
+                  print("RSS error:", e)
+
+          seen = set()
+          unique = []
+
+          for item in items:
+              if item[0] not in seen:
+                  seen.add(item[0])
+                  unique.append(item)
+
+          keywords = {
+              "新作":5,
+              "発売":4,
+              "アップデート":5,
+              "無料":5,
+              "協力":4,
+              "クロスプレイ":6,
+              "Switch":3,
+              "PS5":3,
+              "PC":2,
+              "子供":5,
+              "モンスター":4,
+              "育成":4
+          }
+
+          def score(title):
+              s = sum(v for k,v in keywords.items() if k in title)
+              if any(x in title for x in ["攻略","最強","レビュー"]):
+                  s -= 2
+              return s
+
+          unique.sort(key=lambda x: score(x[0]), reverse=True)
+
+          if unique:
+              title, link = unique[0]
+          else:
+              title = "今日のゲームニュースをチェック"
+              link = ""
+
+          title = re.sub(r"\s+", " ", title)
+
+          if len(title) > 38:
+              title = title[:37] + "…"
+
+          today = datetime.now(
+              timezone(timedelta(hours=9))
+          ).strftime("%Y/%m/%d")
+
+          img = Image.new("RGB", (1080,1920), (17,17,17))
+          draw = ImageDraw.Draw(img)
+
+          font_big = ImageFont.truetype(
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 64
+          )
+          font_title = ImageFont.truetype(
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 54
+          )
+          font = ImageFont.truetype(
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 40
+          )
+          font_small = ImageFont.truetype(
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 30
+          )
+
+          draw.rounded_rectangle(
+              (60,60,1020,1860),
+              radius=45,
+              fill=(30,30,30)
+          )
+
+          draw.text((90,110), "GAME RADAR",
+                    font=font_big, fill="white")
+
+          draw.text((90,205), today,
+                    font=font_small, fill=(170,170,170))
+
+          draw.text((90,360),
+                    "今日の注目ゲーム情報",
+                    font=font_title, fill="white")
+
+          # タイトルを簡易折り返し
+          lines = []
+          line = ""
+
+          for ch in title:
+              test = line + ch
+              box = draw.textbbox((0,0), test, font=font_title)
+              if box[2] > 900:
+                  lines.append(line)
+                  line = ch
+              else:
+                  line = test
+
+          if line:
+              lines.append(line)
+
+          y = 520
+
+          for line in lines[:5]:
+              draw.text((90,y), line,
+                        font=font_title, fill="white")
+              y += 90
+
+          draw.text((90,1120),
+                    "こんな人はチェック",
+                    font=font, fill=(180,180,180))
+
+          draw.text((90,1210),
+                    "・新作ゲームが好き",
+                    font=font, fill="white")
+
+          draw.text((90,1290),
+                    "・家族や友達と遊びたい",
+                    font=font, fill="white")
+
+          draw.text((90,1370),
+                    "・クロスプレイを探している",
+                    font=font, fill="white")
+
+          draw.text((90,1690),
+                    "毎日1回、自動でゲーム情報を収集",
+                    font=font_small, fill=(130,130,130))
+
+          img.save("/tmp/game.png")
+
+          open("output/latest.txt","w",encoding="utf-8").write(
+              today + "\n" + title + "\n" + link
+          )
+          PY
+
+          ffmpeg -y \
+            -loop 1 \
+            -i /tmp/game.png \
+            -t 15 \
+            -r 30 \
+            -pix_fmt yuv420p \
+            -c:v libx264 \
+            -preset veryfast \
+            -crf 24 \
+            output/game_radar.mp4
+
+      - name: Upload video
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-radar-video
+          path: output/game_radar.mp4
+          retention-days: 7
