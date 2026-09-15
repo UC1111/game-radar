@@ -1,4 +1,4 @@
-name: Game Radar Video
+name: Auto Game News TikTok
 
 on:
   workflow_dispatch:
@@ -6,193 +6,945 @@ on:
     - cron: "10 7 * * *"
       timezone: "Asia/Tokyo"
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  make-video:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pil fonts-noto-cjk
+          sudo apt-get install -y ffmpeg fonts-noto-cjk python3 python3-pip
+          python3 -m pip install requests beautifulsoup4 pillow
 
-      - name: Create video
+      - name: Create generator
         run: |
-          python3 <<'PY'
-          import os, re, html, urllib.request, urllib.parse
+          cat > make_game_news.py <<'PY'
+          import os, re, html, urllib.parse, subprocess, sys
           from xml.etree import ElementTree as ET
-          from PIL import Image, ImageDraw, ImageFont
           from datetime import datetime, timezone, timedelta
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image, ImageDraw, ImageFont
 
-          os.makedirs("output", exist_ok=True)
+          W, H, FPS = 1080, 1920, 30
+          OUT = "output"
+          TMP = "/tmp/game_news"
 
-          queries = [
-              "ゲーム 新作 アップデート",
-              "Switch 協力プレイ ゲーム",
-              "PS5 PC クロスプレイ ゲーム",
-              "子供 一緒に遊べる ゲーム"
+          os.makedirs(OUT, exist_ok=True)
+          os.makedirs(TMP, exist_ok=True)
+
+          FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+          BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+
+          S = requests.Session()
+          S.headers.update({
+              "User-Agent": "Mozilla/5.0 (compatible; GameNewsRadar/1.0)"
+          })
+
+          QUERIES = [
+              "ゲーム 発売決定 新作",
+              "ゲーム 発売日 発表",
+              "ゲーム PS5 PC Switch 発売",
+              "ゲーム Steam 新作 発売日",
+              "ゲーム クロスプレイ 発表",
           ]
 
-          items = []
+          def rss():
+              rows = []
 
-          for q in queries:
+              for q in QUERIES:
+                  u = (
+                      "https://news.google.com/rss/search?q="
+                      + urllib.parse.quote(q + " when:1d")
+                      + "&hl=ja&gl=JP&ceid=JP:ja"
+                  )
+
+                  try:
+                      x = ET.fromstring(S.get(u, timeout=20).content)
+
+                      for i in x.findall(".//item"):
+                          t = html.unescape(
+                              i.findtext("title", "")
+                          ).strip()
+
+                          link = i.findtext("link", "").strip()
+
+                          desc = html.unescape(
+                              i.findtext("description", "")
+                          ).strip()
+
+                          if t and link:
+                              rows.append((t, link, desc))
+
+                  except Exception as e:
+                      print("RSS", e)
+
+              seen = set()
+              out = []
+
+              for r in rows:
+                  if r[0] not in seen:
+                      seen.add(r[0])
+                      out.append(r)
+
+              return out
+
+          def article(url):
               try:
-                  url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(q + " when:1d") + "&hl=ja&gl=JP&ceid=JP:ja"
-                  req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
-                  data = urllib.request.urlopen(req, timeout=20).read()
-                  root = ET.fromstring(data)
+                  r = S.get(
+                      url,
+                      timeout=20,
+                      allow_redirects=True
+                  )
+                  r.raise_for_status()
 
-                  for item in root.findall(".//item"):
-                      title = html.unescape(item.findtext("title","")).strip()
-                      link = item.findtext("link","").strip()
-                      if title:
-                          items.append((title, link))
+                  soup = BeautifulSoup(
+                      r.text,
+                      "html.parser"
+                  )
+
+                  title_tag = soup.find(
+                      "meta",
+                      property="og:title"
+                  )
+
+                  desc_tag = soup.find(
+                      "meta",
+                      attrs={"name": "description"}
+                  )
+
+                  if not desc_tag:
+                      desc_tag = soup.find(
+                          "meta",
+                          property="og:description"
+                      )
+
+                  img_tag = (
+                      soup.find(
+                          "meta",
+                          property="og:image"
+                      )
+                      or
+                      soup.find(
+                          "meta",
+                          attrs={"name": "twitter:image"}
+                      )
+                  )
+
+                  title = (
+                      title_tag.get("content", "")
+                      if title_tag else ""
+                  )
+
+                  desc = (
+                      desc_tag.get("content", "")
+                      if desc_tag else ""
+                  )
+
+                  img = (
+                      img_tag.get("content", "")
+                      if img_tag else ""
+                  )
+
+                  return (
+                      r.url,
+                      title or "",
+                      desc or "",
+                      img or ""
+                  )
+
               except Exception as e:
-                  print("RSS error:", e)
+                  print("ARTICLE", e)
+                  return url, "", "", ""
 
-          seen = set()
-          unique = []
+          def tokens(title):
+              t = re.sub(
+                  r"[【】\[\]（）()「」『』｜|:：,，、.!！?？/／]",
+                  " ",
+                  title
+              )
 
-          for item in items:
-              if item[0] not in seen:
-                  seen.add(item[0])
-                  unique.append(item)
+              t = re.sub(r"\s+", " ", t).strip()
 
-          keywords = {
-              "新作":5,
-              "発売":4,
-              "アップデート":5,
-              "無料":5,
-              "協力":4,
-              "クロスプレイ":6,
-              "Switch":3,
-              "PS5":3,
-              "PC":2,
-              "子供":5,
-              "モンスター":4,
-              "育成":4
-          }
+              for sep in [" - ", " — ", " | "]:
+                  if sep in t:
+                      t = t.split(sep)[0]
 
-          def score(title):
-              s = sum(v for k,v in keywords.items() if k in title)
-              if any(x in title for x in ["攻略","最強","レビュー"]):
-                  s -= 2
-              return s
+              return t
 
-          unique.sort(key=lambda x: score(x[0]), reverse=True)
+          def steam_search(name):
+              try:
+                  u = (
+                      "https://store.steampowered.com/api/"
+                      "storesearch/"
+                  )
 
-          if unique:
-              title, link = unique[0]
-          else:
-              title = "今日のゲームニュースをチェック"
-              link = ""
+                  p = {
+                      "term": name,
+                      "cc": "jp",
+                      "l": "japanese",
+                      "supportedlang": "japanese"
+                  }
 
-          title = re.sub(r"\s+", " ", title)
+                  j = S.get(
+                      u,
+                      params=p,
+                      timeout=20
+                  ).json()
 
-          if len(title) > 38:
-              title = title[:37] + "…"
+                  items = j.get("items", [])
 
-          today = datetime.now(
-              timezone(timedelta(hours=9))
-          ).strftime("%Y/%m/%d")
+                  if not items:
+                      return None
 
-          img = Image.new("RGB", (1080,1920), (17,17,17))
-          draw = ImageDraw.Draw(img)
+                  nt = set(
+                      re.findall(
+                          r"[a-z0-9一-龯ぁ-んァ-ン]{2,}",
+                          name.lower()
+                      )
+                  )
 
-          font_big = ImageFont.truetype(
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 64
-          )
-          font_title = ImageFont.truetype(
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 54
-          )
-          font = ImageFont.truetype(
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 40
-          )
-          font_small = ImageFont.truetype(
-              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 30
-          )
+                  best = None
+                  best_score = 0
 
-          draw.rounded_rectangle(
-              (60,60,1020,1860),
-              radius=45,
-              fill=(30,30,30)
-          )
+                  for x in items[:10]:
+                      st = x.get("name", "")
 
-          draw.text((90,110), "GAME RADAR",
-                    font=font_big, fill="white")
+                      xt = set(
+                          re.findall(
+                              r"[a-z0-9一-龯ぁ-んァ-ン]{2,}",
+                              st.lower()
+                          )
+                      )
 
-          draw.text((90,205), today,
-                    font=font_small, fill=(170,170,170))
+                      score = len(nt & xt)
 
-          draw.text((90,360),
-                    "今日の注目ゲーム情報",
-                    font=font_title, fill="white")
+                      if st.lower() == name.lower():
+                          score += 20
 
-          # タイトルを簡易折り返し
-          lines = []
-          line = ""
+                      if score > best_score:
+                          best_score = score
+                          best = x
 
-          for ch in title:
-              test = line + ch
-              box = draw.textbbox((0,0), test, font=font_title)
-              if box[2] > 900:
-                  lines.append(line)
-                  line = ch
+                  return best if best_score >= 1 else None
+
+              except Exception as e:
+                  print("STEAM SEARCH", e)
+                  return None
+
+          def steam_details(appid):
+              try:
+                  u = (
+                      "https://store.steampowered.com/api/"
+                      f"appdetails?appids={appid}&cc=jp&l=japanese"
+                  )
+
+                  j = S.get(
+                      u,
+                      timeout=20
+                  ).json()
+
+                  d = j.get(
+                      str(appid),
+                      {}
+                  ).get("data", {})
+
+                  return d if d else None
+
+              except Exception as e:
+                  print("STEAM DETAILS", e)
+                  return None
+
+          def release_date(text):
+              patterns = [
+                  r"(?:発売日|発売|リリース|配信開始|発売予定)"
+                  r"[^0-9]{0,25}"
+                  r"(20\d{2})\s*[年./-]\s*"
+                  r"(\d{1,2})\s*[月./-]\s*"
+                  r"(\d{1,2})\s*日?",
+
+                  r"(20\d{2})\s*年\s*"
+                  r"(\d{1,2})\s*月\s*"
+                  r"(\d{1,2})\s*日",
+
+                  r"(20\d{2})[./-]"
+                  r"(\d{1,2})[./-]"
+                  r"(\d{1,2})"
+              ]
+
+              for p in patterns:
+                  m = re.search(p, text)
+
+                  if m:
+                      y, mo, d = map(int, m.groups())
+
+                      try:
+                          datetime(y, mo, d)
+                          return f"{y:04d}/{mo:02d}/{d:02d}"
+                      except ValueError:
+                          pass
+
+              return ""
+
+          def platforms(text):
+              found = []
+
+              checks = [
+                  ("PS5", r"\bPS5\b|PlayStation\s*5"),
+                  ("PS4", r"\bPS4\b|PlayStation\s*4"),
+                  (
+                      "Nintendo Switch 2",
+                      r"Switch\s*2"
+                  ),
+                  (
+                      "Nintendo Switch",
+                      r"(?:Nintendo\s*)?Switch(?!\s*2)"
+                  ),
+                  (
+                      "Xbox Series X|S",
+                      r"Xbox\s*Series"
+                  ),
+                  (
+                      "Xbox One",
+                      r"Xbox\s*One"
+                  ),
+                  (
+                      "PC",
+                      r"\bPC\b|Steam"
+                  ),
+              ]
+
+              for name, pattern in checks:
+                  if re.search(
+                      pattern,
+                      text,
+                      re.I
+                  ):
+                      found.append(name)
+
+              return found
+
+          def game_name(title):
+              t = tokens(title)
+
+              m = re.match(
+                  r"(.{2,40}?)(?:が|の|に|は|、)",
+                  t
+              )
+
+              if m:
+                  return m.group(1).strip()
+
+              return t[:45]
+
+          def image_download(url):
+              if not url:
+                  return None
+
+              try:
+                  r = S.get(
+                      url,
+                      timeout=20
+                  )
+
+                  if "image" not in r.headers.get(
+                      "content-type",
+                      ""
+                  ):
+                      return None
+
+                  path = f"{TMP}/game.jpg"
+
+                  with open(path, "wb") as f:
+                      f.write(r.content)
+
+                  im = Image.open(path).convert("RGB")
+
+                  if im.width < 500 or im.height < 300:
+                      return None
+
+                  im.thumbnail(
+                      (1800, 1800)
+                  )
+
+                  im.save(
+                      path,
+                      "JPEG",
+                      quality=92
+                  )
+
+                  return path
+
+              except Exception as e:
+                  print("IMAGE", e)
+                  return None
+
+          def font(size, bold=False):
+              return ImageFont.truetype(
+                  BOLD if bold else FONT,
+                  size
+              )
+
+          def wrap(draw, text, f, max_width):
+              lines = []
+              current = ""
+
+              for c in text:
+                  test = current + c
+
+                  if draw.textbbox(
+                      (0, 0),
+                      test,
+                      font=f
+                  )[2] <= max_width:
+                      current = test
+                  else:
+                      if current:
+                          lines.append(current)
+
+                      current = c
+
+              if current:
+                  lines.append(current)
+
+              return lines
+
+          def fit(draw, text, max_width, high=72, low=34):
+              for n in range(
+                  high,
+                  low - 1,
+                  -2
+              ):
+                  f = font(n, True)
+
+                  if draw.textbbox(
+                      (0, 0),
+                      text,
+                      font=f
+                  )[2] <= max_width:
+                      return f
+
+              return font(low, True)
+
+          def bg(path, darken=100):
+              im = Image.open(path).convert("RGB")
+
+              scale = max(
+                  W / im.width,
+                  H / im.height
+              )
+
+              im = im.resize(
+                  (
+                      int(im.width * scale),
+                      int(im.height * scale)
+                  ),
+                  Image.Resampling.LANCZOS
+              )
+
+              left = (im.width - W) // 2
+              top = (im.height - H) // 2
+
+              im = im.crop(
+                  (
+                      left,
+                      top,
+                      left + W,
+                      top + H
+                  )
+              )
+
+              overlay = Image.new(
+                  "RGBA",
+                  (W, H),
+                  (0, 0, 0, darken)
+              )
+
+              return Image.alpha_composite(
+                  im.convert("RGBA"),
+                  overlay
+              ).convert("RGB")
+
+          def box(draw, y, height=260):
+              draw.rounded_rectangle(
+                  (
+                      55,
+                      y,
+                      1025,
+                      y + height
+                  ),
+                  35,
+                  fill=(0, 0, 0, 205)
+              )
+
+          def make_scene(
+              index,
+              img,
+              name,
+              headline,
+              plats,
+              date
+          ):
+              im = bg(img, 110)
+              draw = ImageDraw.Draw(im)
+
+              if index == 0:
+                  draw.text(
+                      (70, 100),
+                      "GAME NEWS",
+                      font=font(42, True),
+                      fill="white"
+                  )
+
+                  box(draw, 230, 520)
+
+                  draw.text(
+                      (95, 285),
+                      "これ、ちょっと気になる。",
+                      font=fit(
+                          draw,
+                          "これ、ちょっと気になる。",
+                          880,
+                          78,
+                          44
+                      ),
+                      fill="white"
+                  )
+
+                  f = fit(
+                      draw,
+                      name,
+                      880,
+                      76,
+                      38
+                  )
+
+                  y = 430
+
+                  for line in wrap(
+                      draw,
+                      name,
+                      f,
+                      850
+                  )[:3]:
+                      draw.text(
+                          (95, y),
+                          line,
+                          font=f,
+                          fill="white",
+                          stroke_width=2,
+                          stroke_fill="black"
+                      )
+
+                      y += 85
+
+              elif index == 1:
+                  draw.text(
+                      (70, 100),
+                      "新作ニュース",
+                      font=font(48, True),
+                      fill="white"
+                  )
+
+                  box(draw, 320, 800)
+
+                  f = fit(
+                      draw,
+                      headline,
+                      850,
+                      68,
+                      34
+                  )
+
+                  y = 400
+
+                  for line in wrap(
+                      draw,
+                      headline,
+                      f,
+                      830
+                  )[:6]:
+                      draw.text(
+                          (95, y),
+                          line,
+                          font=f,
+                          fill="white",
+                          stroke_width=2,
+                          stroke_fill="black"
+                      )
+
+                      y += f.size + 18
+
+              elif index == 2:
+                  draw.text(
+                      (70, 100),
+                      "対応機種",
+                      font=font(52, True),
+                      fill="white"
+                  )
+
+                  box(draw, 250, 330)
+
+                  platform_text = " / ".join(plats)
+
+                  f = fit(
+                      draw,
+                      platform_text,
+                      850,
+                      62,
+                      34
+                  )
+
+                  draw.text(
+                      (95, 365),
+                      platform_text,
+                      font=f,
+                      fill="white"
+                  )
+
+                  draw.text(
+                      (70, 760),
+                      "発売日",
+                      font=font(52, True),
+                      fill="white"
+                  )
+
+                  box(draw, 900, 330)
+
+                  f = fit(
+                      draw,
+                      date,
+                      850,
+                      76,
+                      40
+                  )
+
+                  draw.text(
+                      (95, 1015),
+                      date,
+                      font=f,
+                      fill="white"
+                  )
+
+              elif index == 3:
+                  draw.text(
+                      (70, 100),
+                      "15秒でここだけ確認",
+                      font=font(50, True),
+                      fill="white"
+                  )
+
+                  for y, text in [
+                      (420, "✓ 新作タイトル"),
+                      (680, "✓ 対応機種"),
+                      (940, "✓ 発売日")
+                  ]:
+                      box(draw, y, 180)
+
+                      draw.text(
+                          (100, y + 52),
+                          text,
+                          font=font(46, True),
+                          fill="white"
+                      )
+
               else:
-                  line = test
+                  draw.text(
+                      (70, 130),
+                      "発売日：" + date,
+                      font=font(50, True),
+                      fill="white"
+                  )
 
-          if line:
-              lines.append(line)
+                  platform_text = " / ".join(plats)
 
-          y = 520
+                  f = fit(
+                      draw,
+                      platform_text,
+                      880,
+                      52,
+                      32
+                  )
 
-          for line in lines[:5]:
-              draw.text((90,y), line,
-                        font=font_title, fill="white")
-              y += 90
+                  draw.text(
+                      (70, 270),
+                      platform_text,
+                      font=f,
+                      fill="white"
+                  )
 
-          draw.text((90,1120),
-                    "こんな人はチェック",
-                    font=font, fill=(180,180,180))
+                  box(draw, 1320, 390)
 
-          draw.text((90,1210),
-                    "・新作ゲームが好き",
-                    font=font, fill="white")
+                  draw.text(
+                      (100, 1410),
+                      "気になるなら保存",
+                      font=font(62, True),
+                      fill="white"
+                  )
 
-          draw.text((90,1290),
-                    "・家族や友達と遊びたい",
-                    font=font, fill="white")
+                  draw.text(
+                      (100, 1510),
+                      "次のゲームニュースも",
+                      font=font(42, True),
+                      fill="white"
+                  )
 
-          draw.text((90,1370),
-                    "・クロスプレイを探している",
-                    font=font, fill="white")
+                  draw.text(
+                      (100, 1575),
+                      "毎日チェック。",
+                      font=font(48, True),
+                      fill="white"
+                  )
 
-          draw.text((90,1690),
-                    "毎日1回、自動でゲーム情報を収集",
-                    font=font_small, fill=(130,130,130))
+              return im
 
-          img.save("/tmp/game.png")
+          items = rss()
 
-          open("output/latest.txt","w",encoding="utf-8").write(
-              today + "\n" + title + "\n" + link
+          items = [
+              x for x in items
+              if not any(
+                  k in x[0]
+                  for k in [
+                      "攻略",
+                      "最強",
+                      "コード",
+                      "中古",
+                      "セール",
+                      "プレゼント"
+                  ]
+              )
+          ]
+
+          items.sort(
+              key=lambda x: sum(
+                  k in x[0]
+                  for k in [
+                      "発売",
+                      "新作",
+                      "発表",
+                      "対応機種"
+                  ]
+              ),
+              reverse=True
           )
+
+          selected = None
+
+          for title, link, desc in items[:40]:
+
+              final_url, og_title, og_desc, og_image = article(link)
+
+              text = " ".join([
+                  title,
+                  desc,
+                  og_title,
+                  og_desc
+              ])
+
+              name = game_name(title)
+
+              date = release_date(text)
+              plats = platforms(text)
+
+              if not date or not plats:
+                  continue
+
+              steam_result = steam_search(name)
+
+              steam = None
+
+              if steam_result:
+                  steam = steam_details(
+                      steam_result.get("id")
+                  )
+
+              img = None
+
+              if steam and steam.get(
+                  "header_image"
+              ):
+                  img = image_download(
+                      steam["header_image"]
+                  )
+
+              if not img:
+                  img = image_download(
+                      og_image
+                  )
+
+              if not img:
+                  continue
+
+              selected = (
+                  title,
+                  final_url,
+                  desc + " " + og_desc,
+                  name,
+                  date,
+                  plats,
+                  img
+              )
+
+              break
+
+          if not selected:
+              print(
+                  "条件を満たすニュースがありません。"
+                  "動画は生成しません。"
+              )
+              sys.exit(0)
+
+          title, url, text, name, date, plats, img = selected
+
+          print(
+              "SELECTED",
+              title,
+              date,
+              plats,
+              img
+          )
+
+          scenes = []
+
+          for i in range(5):
+              path = f"{TMP}/scene{i}.png"
+
+              make_scene(
+                  i,
+                  img,
+                  name,
+                  title,
+                  plats,
+                  date
+              ).save(path)
+
+              scenes.append(path)
+
+          inputs = []
+
+          for path in scenes:
+              inputs += [
+                  "-loop",
+                  "1",
+                  "-t",
+                  "3",
+                  "-i",
+                  path
+              ]
+
+          filters = []
+          labels = []
+
+          for i in range(5):
+
+              filters.append(
+                  f"[{i}:v]"
+                  f"scale=1080:1920:"
+                  f"force_original_aspect_ratio=increase,"
+                  f"crop=1080:1920,"
+                  f"zoompan="
+                  f"z='min(zoom+0.0008,1.05)':"
+                  f"d={FPS*3}:"
+                  f"s=1080x1920:"
+                  f"fps={FPS},"
+                  f"format=yuv420p"
+                  f"[v{i}]"
+              )
+
+              labels.append(f"[v{i}]")
+
+          filters.append(
+              "".join(labels)
+              + "concat=n=5:v=1:a=0[v]"
+          )
+
+          cmd = [
+              "ffmpeg",
+              "-y",
+              *inputs,
+              "-filter_complex",
+              ";".join(filters),
+              "-map",
+              "[v]",
+              "-c:v",
+              "libx264",
+              "-preset",
+              "veryfast",
+              "-crf",
+              "22",
+              "-movflags",
+              "+faststart",
+              f"{OUT}/game_news_tiktok.mp4"
+          ]
+
+          subprocess.run(
+              cmd,
+              check=True
+          )
+
+          now = datetime.now(
+              timezone(
+                  timedelta(hours=9)
+              )
+          ).isoformat()
+
+          with open(
+              f"{OUT}/source.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              f.write(
+                  f"generated={now}\n"
+              )
+
+              f.write(
+                  f"title={title}\n"
+              )
+
+              f.write(
+                  f"source={url}\n"
+              )
+
+              f.write(
+                  f"game={name}\n"
+              )
+
+              f.write(
+                  f"release={date}\n"
+              )
+
+              f.write(
+                  f"platforms={','.join(plats)}\n"
+              )
+
+              f.write(
+                  "status=complete_no_manual_edit_required\n"
+              )
+
+          print(
+              "COMPLETE",
+              f"{OUT}/game_news_tiktok.mp4"
+          )
+
           PY
 
-          ffmpeg -y \
-            -loop 1 \
-            -i /tmp/game.png \
-            -t 15 \
-            -r 30 \
-            -pix_fmt yuv420p \
-            -c:v libx264 \
-            -preset veryfast \
-            -crf 24 \
-            output/game_radar.mp4
+          python3 make_game_news.py
 
-      - name: Upload video
+      - name: Upload completed video
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: game-radar-video
-          path: output/game_radar.mp4
+          name: game-news-tiktok-${{ github.run_number }}
+          path: |
+            output/game_news_tiktok.mp4
+            output/source.txt
           retention-days: 7
+          if-no-files-found: ignore
